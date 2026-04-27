@@ -1,0 +1,320 @@
+"""
+GMC Content API → BigQuery Pipeline
+Pulls MerchantPerformanceView data via Content API for Shopping
+and MERGEs into BigQuery target table.
+
+Prerequisites:
+    1. Service account JSON key with Merchant Center access
+       - Add the service account email as a user in Merchant Center
+         via Settings > People and access
+       - Grant "Reporting manager" role at minimum
+    2. BigQuery admin on the destination dataset
+    3. pip install google-api-python-client google-auth google-cloud-bigquery
+
+Usage:
+    python gmc_content_api.py                          # default: yesterday to yesterday
+    python gmc_content_api.py --start 2025-01-01       # backfill from date to yesterday
+    python gmc_content_api.py --start 2025-01-01 --end 2025-03-31  # custom range
+    python gmc_content_api.py --days 7                 # last 7 days
+
+Notes:
+    - Content API for Shopping sunsets August 18, 2026.
+      After that, migrate to the new Merchant API
+      (product_performance_view via accounts.reports.search).
+    - The API only returns rows where at least one metric is non-zero.
+    - Pagination is handled automatically (default page size 1000).
+"""
+
+import argparse
+import json
+import logging
+from datetime import date, datetime, timedelta
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from google.cloud import bigquery
+
+# ──────────────────────────────────────────────────────────────────────
+# CONFIGURATION — update these values
+# ──────────────────────────────────────────────────────────────────────
+MERCHANT_ID = "120543441"  # Your Merchant Center ID
+SERVICE_ACCOUNT_KEY = "/path/to/your/service-account.json"  # Path to SA key
+
+# BigQuery destination
+BQ_PROJECT = "paid-search-fy26"
+BQ_DATASET = "GMC"
+BQ_TABLE = "GMC_report_total"
+BQ_STAGING_TABLE = "GMC_report_staging"  # Temp table for MERGE source
+
+# Full table references
+TARGET_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+STAGING_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_STAGING_TABLE}"
+
+# API config
+SCOPES = ["https://www.googleapis.com/auth/content"]
+API_SERVICE_NAME = "content"
+API_VERSION = "v2.1"
+PAGE_SIZE = 1000
+
+# ──────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+def get_credentials():
+    """Build credentials from service account key."""
+    credentials = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_KEY, scopes=SCOPES
+    )
+    return credentials
+
+
+def build_service(credentials):
+    """Build the Content API service object."""
+    return build(API_SERVICE_NAME, API_VERSION, credentials=credentials)
+
+
+def fetch_performance_data(service, start_date: str, end_date: str) -> list[dict]:
+    """
+    Query MerchantPerformanceView for the given date range.
+    Returns list of dicts with keys: date, program, country_code, impressions, clicks.
+    Handles pagination automatically.
+    """
+    query = f"""
+        SELECT 
+            segments.date,
+            segments.program,
+            segments.customer_country_code,
+            metrics.impressions,
+            metrics.clicks
+        FROM MerchantPerformanceView
+        WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+    """
+
+    logger.info(f"Querying Content API: {start_date} to {end_date}")
+
+    all_rows = []
+    page_token = None
+
+    while True:
+        request_body = {"query": query, "pageSize": PAGE_SIZE}
+        if page_token:
+            request_body["pageToken"] = page_token
+
+        response = (
+            service.reports()
+            .search(merchantId=MERCHANT_ID, body=request_body)
+            .execute()
+        )
+
+        results = response.get("results", [])
+
+        for row in results:
+            segments = row.get("segments", {})
+            metrics = row.get("metrics", {})
+
+            # Date comes back as {year, month, day} object
+            date_obj = segments.get("date", {})
+            row_date = (
+                f"{date_obj['year']}-{date_obj['month']:02d}-{date_obj['day']:02d}"
+            )
+
+            all_rows.append(
+                {
+                    "date": row_date,
+                    "program": segments.get("program", "UNKNOWN"),
+                    "country_code": segments.get("customerCountryCode", "UNKNOWN"),
+                    "impressions": int(metrics.get("impressions", 0)),
+                    "clicks": int(metrics.get("clicks", 0)),
+                }
+            )
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+        logger.info(f"  Fetched {len(all_rows)} rows so far, paginating...")
+
+    logger.info(f"Total rows fetched: {len(all_rows)}")
+    return all_rows
+
+
+def aggregate_rows(rows: list[dict]) -> list[dict]:
+    """
+    Aggregate rows by (date, program, country_code) to match
+    the grain of the target table.
+    The API may return finer-grained rows if other segments are 
+    implicitly present; this ensures we match the MERGE key.
+    """
+    agg = {}
+    for row in rows:
+        key = (row["date"], row["program"], row["country_code"])
+        if key not in agg:
+            agg[key] = {"date": row["date"], "program": row["program"],
+                        "country_code": row["country_code"],
+                        "impressions": 0, "clicks": 0}
+        agg[key]["impressions"] += row["impressions"]
+        agg[key]["clicks"] += row["clicks"]
+    
+    return list(agg.values())
+
+
+def load_to_staging(bq_client, rows: list[dict]):
+    """
+    Load aggregated rows into a BigQuery staging table.
+    Overwrites the staging table each run.
+    """
+    logger.info(f"Loading {len(rows)} rows to staging: {STAGING_TABLE}")
+
+    schema = [
+        bigquery.SchemaField("date", "DATE"),
+        bigquery.SchemaField("program", "STRING"),
+        bigquery.SchemaField("country_code", "STRING"),
+        bigquery.SchemaField("impressions", "INTEGER"),
+        bigquery.SchemaField("clicks", "INTEGER"),
+    ]
+
+    job_config = bigquery.LoadJobConfig(
+        schema=schema,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+    )
+
+    job = bq_client.load_table_from_json(
+        rows, STAGING_TABLE, job_config=job_config
+    )
+    job.result()  # Wait for completion
+    logger.info(f"Staging load complete: {job.output_rows} rows")
+
+
+def merge_to_target(bq_client):
+    """
+    MERGE staging into the target table.
+    Matches on (program, date, country_code).
+    Updates clicks and impressions if matched,
+    inserts new rows if not matched.
+    """
+    merge_sql = f"""
+    MERGE `{TARGET_TABLE}` AS target
+    USING `{STAGING_TABLE}` AS source
+    ON target.program = source.program
+       AND target.date = source.date
+       AND target.country_code = source.country_code
+    WHEN MATCHED THEN
+        UPDATE SET
+            clicks = source.clicks,
+            impressions = source.impressions
+    WHEN NOT MATCHED THEN
+        INSERT (program, date, clicks, country_code, impressions)
+        VALUES (source.program, source.date, source.clicks, 
+                source.country_code, source.impressions)
+    """
+
+    logger.info("Running MERGE into target table...")
+    query_job = bq_client.query(merge_sql)
+    result = query_job.result()
+    
+    # Log DML stats
+    dml = query_job.num_dml_affected_rows
+    logger.info(f"MERGE complete. Rows affected: {dml}")
+
+
+def ensure_target_table(bq_client):
+    """Create the target table if it doesn't exist."""
+    schema = [
+        bigquery.SchemaField("date", "DATE"),
+        bigquery.SchemaField("program", "STRING"),
+        bigquery.SchemaField("country_code", "STRING"),
+        bigquery.SchemaField("impressions", "INTEGER"),
+        bigquery.SchemaField("clicks", "INTEGER"),
+    ]
+
+    table_ref = bigquery.Table(TARGET_TABLE, schema=schema)
+
+    try:
+        bq_client.get_table(TARGET_TABLE)
+        logger.info(f"Target table exists: {TARGET_TABLE}")
+    except Exception:
+        bq_client.create_table(table_ref)
+        logger.info(f"Created target table: {TARGET_TABLE}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Pull GMC performance data via Content API and MERGE into BigQuery"
+    )
+    parser.add_argument(
+        "--start",
+        type=str,
+        help="Start date (YYYY-MM-DD). Defaults to yesterday.",
+    )
+    parser.add_argument(
+        "--end",
+        type=str,
+        help="End date (YYYY-MM-DD). Defaults to yesterday.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        help="Fetch last N days (overrides --start/--end).",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Determine date range
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    if args.days:
+        end_date = yesterday
+        start_date = (date.today() - timedelta(days=args.days)).isoformat()
+    else:
+        start_date = args.start or yesterday
+        end_date = args.end or yesterday
+
+    logger.info(f"Date range: {start_date} to {end_date}")
+
+    # Authenticate
+    credentials = get_credentials()
+
+    # Build Content API service
+    service = build_service(credentials)
+
+    # Build BigQuery client
+    bq_client = bigquery.Client(
+        project=BQ_PROJECT, credentials=credentials
+    )
+
+    # Ensure target table exists
+    ensure_target_table(bq_client)
+
+    # Fetch data from Content API
+    raw_rows = fetch_performance_data(service, start_date, end_date)
+
+    if not raw_rows:
+        logger.warning("No data returned from API. Exiting.")
+        return
+
+    # Aggregate to match target grain
+    agg_rows = aggregate_rows(raw_rows)
+    logger.info(f"Aggregated to {len(agg_rows)} rows")
+
+    # Load to staging
+    load_to_staging(bq_client, agg_rows)
+
+    # MERGE into target
+    merge_to_target(bq_client)
+
+    logger.info("Pipeline complete.")
+
+
+if __name__ == "__main__":
+    main()
