@@ -1,58 +1,71 @@
 """
-GMC Content API → BigQuery Pipeline
-Pulls MerchantPerformanceView data via Content API for Shopping
-and MERGEs into BigQuery target table.
+GMC Content API → BigQuery Pipeline (Cloud Function)
 
-Prerequisites:
-    1. Service account JSON key with Merchant Center access
-       - Add the service account email as a user in Merchant Center
-         via Settings > People and access
-       - Grant "Reporting manager" role at minimum
-    2. BigQuery admin on the destination dataset
-    3. pip install google-api-python-client google-auth google-cloud-bigquery
+Deploys as a Google Cloud Function triggered by Cloud Scheduler.
+Pulls yesterday's MerchantPerformanceView data via Content API
+and MERGEs into BigQuery.
 
-Usage:
-    python gmc_content_api.py                          # default: yesterday to yesterday
-    python gmc_content_api.py --start 2025-01-01       # backfill from date to yesterday
-    python gmc_content_api.py --start 2025-01-01 --end 2025-03-31  # custom range
-    python gmc_content_api.py --days 7                 # last 7 days
+Deployment:
+    gcloud functions deploy gmc-performance-sync \
+        --runtime python312 \
+        --trigger-http \
+        --entry-point main \
+        --timeout 300 \
+        --memory 256MB \
+        --region europe-west2 \
+        --service-account YOUR_SA@PROJECT.iam.gserviceaccount.com \
+        --set-env-vars MERCHANT_ID=120543441,BQ_PROJECT=paid-search-fy26,BQ_DATASET=GMC,BQ_TABLE=GMC_report_total
+
+Cloud Scheduler (daily at 6am UTC):
+    gcloud scheduler jobs create http gmc-daily-sync \
+        --schedule "0 6 * * *" \
+        --uri "https://REGION-PROJECT.cloudfunctions.net/gmc-performance-sync" \
+        --http-method POST \
+        --oidc-service-account-email YOUR_SA@PROJECT.iam.gserviceaccount.com \
+        --time-zone "UTC"
+
+    To trigger a backfill via scheduler or curl:
+    curl -X POST https://REGION-PROJECT.cloudfunctions.net/gmc-performance-sync \
+        -H "Authorization: bearer $(gcloud auth print-identity-token)" \
+        -H "Content-Type: application/json" \
+        -d '{"start_date": "2024-06-01", "end_date": "2025-04-28"}'
 
 Notes:
     - Content API for Shopping sunsets August 18, 2026.
-      After that, migrate to the new Merchant API
-      (product_performance_view via accounts.reports.search).
-    - The API only returns rows where at least one metric is non-zero.
-    - Pagination is handled automatically (default page size 1000).
+    - Uses Application Default Credentials (ADC) in Cloud Functions,
+      so no service account key file needed — just attach the right SA
+      to the function at deploy time.
+    - The SA needs: Content API scope, Merchant Center Reporting access,
+      BigQuery Data Editor + Job User on the destination project.
 """
 
-import argparse
+import os
 import json
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
-from google.oauth2 import service_account
+import flask
+import functions_framework
+from google.auth import default as get_default_credentials
 from googleapiclient.discovery import build
 from google.cloud import bigquery
 
 # ──────────────────────────────────────────────────────────────────────
-# CONFIGURATION — update these values
+# CONFIGURATION — set via environment variables or defaults
 # ──────────────────────────────────────────────────────────────────────
-MERCHANT_ID = "120543441"  # Your Merchant Center ID
-SERVICE_ACCOUNT_KEY = "/path/to/your/service-account.json"  # Path to SA key
+MERCHANT_ID = os.environ.get("MERCHANT_ID", "120543441")
+BQ_PROJECT = os.environ.get("BQ_PROJECT", "paid-search-fy26")
+BQ_DATASET = os.environ.get("BQ_DATASET", "GMC")
+BQ_TABLE = os.environ.get("BQ_TABLE", "GMC_report_total")
+BQ_STAGING_TABLE = os.environ.get("BQ_STAGING_TABLE", "GMC_report_staging")
 
-# BigQuery destination
-BQ_PROJECT = "paid-search-fy26"
-BQ_DATASET = "GMC"
-BQ_TABLE = "GMC_report_total"
-BQ_STAGING_TABLE = "GMC_report_staging"  # Temp table for MERGE source
-
-# Full table references
 TARGET_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 STAGING_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_STAGING_TABLE}"
 
-# API config
-SCOPES = ["https://www.googleapis.com/auth/content"]
-API_SERVICE_NAME = "content"
+SCOPES = [
+    "https://www.googleapis.com/auth/content",
+    "https://www.googleapis.com/auth/bigquery",
+]
 API_VERSION = "v2.1"
 PAGE_SIZE = 1000
 
@@ -67,35 +80,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Core pipeline functions
+# ──────────────────────────────────────────────────────────────────────
 def get_credentials():
-    """Build credentials from service account key."""
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_KEY, scopes=SCOPES
-    )
+    """
+    Use Application Default Credentials (ADC).
+    In Cloud Functions, this automatically uses the attached service account.
+    Locally, it uses gcloud auth application-default credentials.
+    """
+    credentials, project = get_default_credentials(scopes=SCOPES)
     return credentials
 
 
-def build_service(credentials):
+def build_content_service(credentials):
     """Build the Content API service object."""
-    return build(API_SERVICE_NAME, API_VERSION, credentials=credentials)
+    return build("content", API_VERSION, credentials=credentials)
 
 
 def fetch_performance_data(service, start_date: str, end_date: str) -> list[dict]:
     """
     Query MerchantPerformanceView for the given date range.
-    Returns list of dicts with keys: date, program, country_code, impressions, clicks.
     Handles pagination automatically.
     """
-    query = f"""
-        SELECT 
-            segments.date,
-            segments.program,
-            segments.customer_country_code,
-            metrics.impressions,
-            metrics.clicks
-        FROM MerchantPerformanceView
-        WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
-    """
+    query = (
+        "SELECT "
+        "segments.date, "
+        "segments.program, "
+        "segments.customer_country_code, "
+        "metrics.impressions, "
+        "metrics.clicks "
+        "FROM MerchantPerformanceView "
+        f"WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'"
+    )
 
     logger.info(f"Querying Content API: {start_date} to {end_date}")
 
@@ -119,7 +136,6 @@ def fetch_performance_data(service, start_date: str, end_date: str) -> list[dict
             segments = row.get("segments", {})
             metrics = row.get("metrics", {})
 
-            # Date comes back as {year, month, day} object
             date_obj = segments.get("date", {})
             row_date = (
                 f"{date_obj['year']}-{date_obj['month']:02d}-{date_obj['day']:02d}"
@@ -146,30 +162,26 @@ def fetch_performance_data(service, start_date: str, end_date: str) -> list[dict
 
 
 def aggregate_rows(rows: list[dict]) -> list[dict]:
-    """
-    Aggregate rows by (date, program, country_code) to match
-    the grain of the target table.
-    The API may return finer-grained rows if other segments are 
-    implicitly present; this ensures we match the MERGE key.
-    """
+    """Aggregate rows by (date, program, country_code) to match target grain."""
     agg = {}
     for row in rows:
         key = (row["date"], row["program"], row["country_code"])
         if key not in agg:
-            agg[key] = {"date": row["date"], "program": row["program"],
-                        "country_code": row["country_code"],
-                        "impressions": 0, "clicks": 0}
+            agg[key] = {
+                "date": row["date"],
+                "program": row["program"],
+                "country_code": row["country_code"],
+                "impressions": 0,
+                "clicks": 0,
+            }
         agg[key]["impressions"] += row["impressions"]
         agg[key]["clicks"] += row["clicks"]
-    
+
     return list(agg.values())
 
 
 def load_to_staging(bq_client, rows: list[dict]):
-    """
-    Load aggregated rows into a BigQuery staging table.
-    Overwrites the staging table each run.
-    """
+    """Load aggregated rows into staging table (truncate + load)."""
     logger.info(f"Loading {len(rows)} rows to staging: {STAGING_TABLE}")
 
     schema = [
@@ -186,20 +198,13 @@ def load_to_staging(bq_client, rows: list[dict]):
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
     )
 
-    job = bq_client.load_table_from_json(
-        rows, STAGING_TABLE, job_config=job_config
-    )
-    job.result()  # Wait for completion
+    job = bq_client.load_table_from_json(rows, STAGING_TABLE, job_config=job_config)
+    job.result()
     logger.info(f"Staging load complete: {job.output_rows} rows")
 
 
 def merge_to_target(bq_client):
-    """
-    MERGE staging into the target table.
-    Matches on (program, date, country_code).
-    Updates clicks and impressions if matched,
-    inserts new rows if not matched.
-    """
+    """MERGE staging into target table."""
     merge_sql = f"""
     MERGE `{TARGET_TABLE}` AS target
     USING `{STAGING_TABLE}` AS source
@@ -212,17 +217,17 @@ def merge_to_target(bq_client):
             impressions = source.impressions
     WHEN NOT MATCHED THEN
         INSERT (program, date, clicks, country_code, impressions)
-        VALUES (source.program, source.date, source.clicks, 
+        VALUES (source.program, source.date, source.clicks,
                 source.country_code, source.impressions)
     """
 
     logger.info("Running MERGE into target table...")
     query_job = bq_client.query(merge_sql)
-    result = query_job.result()
-    
-    # Log DML stats
+    query_job.result()
+
     dml = query_job.num_dml_affected_rows
     logger.info(f"MERGE complete. Rows affected: {dml}")
+    return dml
 
 
 def ensure_target_table(bq_client):
@@ -235,86 +240,86 @@ def ensure_target_table(bq_client):
         bigquery.SchemaField("clicks", "INTEGER"),
     ]
 
-    table_ref = bigquery.Table(TARGET_TABLE, schema=schema)
-
     try:
         bq_client.get_table(TARGET_TABLE)
         logger.info(f"Target table exists: {TARGET_TABLE}")
     except Exception:
+        table_ref = bigquery.Table(TARGET_TABLE, schema=schema)
         bq_client.create_table(table_ref)
         logger.info(f"Created target table: {TARGET_TABLE}")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Pull GMC performance data via Content API and MERGE into BigQuery"
-    )
-    parser.add_argument(
-        "--start",
-        type=str,
-        help="Start date (YYYY-MM-DD). Defaults to yesterday.",
-    )
-    parser.add_argument(
-        "--end",
-        type=str,
-        help="End date (YYYY-MM-DD). Defaults to yesterday.",
-    )
-    parser.add_argument(
-        "--days",
-        type=int,
-        help="Fetch last N days (overrides --start/--end).",
-    )
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-
-    # Determine date range
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
-
-    if args.days:
-        end_date = yesterday
-        start_date = (date.today() - timedelta(days=args.days)).isoformat()
-    else:
-        start_date = args.start or yesterday
-        end_date = args.end or yesterday
-
-    logger.info(f"Date range: {start_date} to {end_date}")
-
-    # Authenticate
+def run_pipeline(start_date: str, end_date: str) -> dict:
+    """Execute the full pipeline. Returns a summary dict."""
     credentials = get_credentials()
+    service = build_content_service(credentials)
+    bq_client = bigquery.Client(project=BQ_PROJECT, credentials=credentials)
 
-    # Build Content API service
-    service = build_service(credentials)
-
-    # Build BigQuery client
-    bq_client = bigquery.Client(
-        project=BQ_PROJECT, credentials=credentials
-    )
-
-    # Ensure target table exists
     ensure_target_table(bq_client)
 
-    # Fetch data from Content API
     raw_rows = fetch_performance_data(service, start_date, end_date)
 
     if not raw_rows:
-        logger.warning("No data returned from API. Exiting.")
-        return
+        logger.warning("No data returned from API.")
+        return {
+            "status": "no_data",
+            "start_date": start_date,
+            "end_date": end_date,
+            "rows_fetched": 0,
+        }
 
-    # Aggregate to match target grain
     agg_rows = aggregate_rows(raw_rows)
     logger.info(f"Aggregated to {len(agg_rows)} rows")
 
-    # Load to staging
     load_to_staging(bq_client, agg_rows)
+    dml = merge_to_target(bq_client)
 
-    # MERGE into target
-    merge_to_target(bq_client)
+    return {
+        "status": "success",
+        "start_date": start_date,
+        "end_date": end_date,
+        "rows_fetched": len(raw_rows),
+        "rows_aggregated": len(agg_rows),
+        "rows_merged": dml,
+    }
 
-    logger.info("Pipeline complete.")
 
+# ──────────────────────────────────────────────────────────────────────
+# Cloud Function entry point
+# ──────────────────────────────────────────────────────────────────────
+@functions_framework.http
+def main(request: flask.Request) -> flask.Response:
+    """
+    HTTP Cloud Function entry point.
 
-if __name__ == "__main__":
-    main()
+    Default (no body): pulls yesterday's data.
+    With JSON body: 
+        {"start_date": "2024-06-01", "end_date": "2025-04-28"}  — backfill
+        {"days": 3}  — last N days
+    """
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    # Parse optional request body
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+
+    if "days" in body:
+        days = int(body["days"])
+        end_date = yesterday
+        start_date = (date.today() - timedelta(days=days)).isoformat()
+    else:
+        start_date = body.get("start_date", yesterday)
+        end_date = body.get("end_date", yesterday)
+
+    logger.info(f"Triggered. Date range: {start_date} to {end_date}")
+
+    try:
+        result = run_pipeline(start_date, end_date)
+        logger.info(f"Result: {result}")
+        return flask.jsonify(result), 200
+
+    except Exception as e:
+        logger.error(f"Pipeline failed: {str(e)}", exc_info=True)
+        return flask.jsonify({"status": "error", "message": str(e)}), 500
