@@ -1,0 +1,188 @@
+"""
+GMC Content API → BigQuery Backfill Script
+Run locally with your service account key.
+Creates GMC_report table and backfills product-level data.
+
+Usage:
+    python gmc_backfill.py
+"""
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from google.cloud import bigquery
+from datetime import date, datetime, timedelta
+import logging
+
+# ──────────────────────────────────────────────────────────────────────
+# CONFIG — update these
+# ──────────────────────────────────────────────────────────────────────
+SERVICE_ACCOUNT_KEY = r"C:\path\to\your\service-account.json"  # <-- update this
+MERCHANT_ID = "120543441"
+BQ_PROJECT = "paid-search-fy26"
+BQ_DATASET = "GMC"
+BQ_TABLE = "GMC_report"
+TARGET_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+
+# Backfill range
+START_DATE = "2024-06-01"
+END_DATE = date.today().isoformat()
+CHUNK_DAYS = 30
+
+# ──────────────────────────────────────────────────────────────────────
+SCOPES = [
+    "https://www.googleapis.com/auth/content",
+    "https://www.googleapis.com/auth/bigquery",
+]
+PAGE_SIZE = 1000
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+TABLE_SCHEMA = [
+    bigquery.SchemaField("date", "DATE"),
+    bigquery.SchemaField("program", "STRING"),
+    bigquery.SchemaField("country_code", "STRING"),
+    bigquery.SchemaField("offer_id", "STRING"),
+    bigquery.SchemaField("impressions", "INTEGER"),
+    bigquery.SchemaField("clicks", "INTEGER"),
+]
+
+
+def get_credentials():
+    return service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_KEY, scopes=SCOPES
+    )
+
+
+def create_table(bq_client):
+    try:
+        bq_client.get_table(TARGET_TABLE)
+        logger.info(f"Table exists: {TARGET_TABLE}")
+    except Exception:
+        table = bigquery.Table(TARGET_TABLE, schema=TABLE_SCHEMA)
+        bq_client.create_table(table)
+        logger.info(f"Created table: {TARGET_TABLE}")
+
+
+def fetch_data(service, start_date, end_date):
+    query = (
+        "SELECT "
+        "segments.date, "
+        "segments.program, "
+        "segments.customer_country_code, "
+        "segments.offer_id, "
+        "metrics.impressions, "
+        "metrics.clicks "
+        "FROM MerchantPerformanceView "
+        f"WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'"
+    )
+
+    logger.info(f"Fetching: {start_date} to {end_date}")
+
+    all_rows = []
+    page_token = None
+
+    while True:
+        request_body = {"query": query, "pageSize": PAGE_SIZE}
+        if page_token:
+            request_body["pageToken"] = page_token
+
+        response = (
+            service.reports()
+            .search(merchantId=MERCHANT_ID, body=request_body)
+            .execute()
+        )
+
+        for row in response.get("results", []):
+            segments = row.get("segments", {})
+            metrics = row.get("metrics", {})
+            date_obj = segments.get("date", {})
+            row_date = f"{date_obj['year']}-{date_obj['month']:02d}-{date_obj['day']:02d}"
+
+            all_rows.append({
+                "date": row_date,
+                "program": segments.get("program", "UNKNOWN"),
+                "country_code": segments.get("customerCountryCode", "UNKNOWN"),
+                "offer_id": segments.get("offerId", "UNKNOWN"),
+                "impressions": int(metrics.get("impressions", 0)),
+                "clicks": int(metrics.get("clicks", 0)),
+            })
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    logger.info(f"  Fetched {len(all_rows)} rows")
+    return all_rows
+
+
+def load_and_merge(bq_client, rows):
+    temp_table = f"{BQ_PROJECT}.{BQ_DATASET}._temp_backfill"
+
+    job_config = bigquery.LoadJobConfig(
+        schema=TABLE_SCHEMA,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+    )
+    job = bq_client.load_table_from_json(rows, temp_table, job_config=job_config)
+    job.result()
+    logger.info(f"  Loaded {job.output_rows} rows to temp")
+
+    merge_sql = f"""
+    MERGE `{TARGET_TABLE}` AS target
+    USING `{temp_table}` AS source
+    ON target.date = source.date
+       AND target.program = source.program
+       AND target.country_code = source.country_code
+       AND target.offer_id = source.offer_id
+    WHEN MATCHED THEN
+        UPDATE SET
+            clicks = source.clicks,
+            impressions = source.impressions
+    WHEN NOT MATCHED THEN
+        INSERT (date, program, country_code, offer_id, clicks, impressions)
+        VALUES (source.date, source.program, source.country_code,
+                source.offer_id, source.clicks, source.impressions)
+    """
+
+    query_job = bq_client.query(merge_sql)
+    query_job.result()
+    logger.info(f"  Merged. Rows affected: {query_job.num_dml_affected_rows}")
+
+    bq_client.delete_table(temp_table, not_found_ok=True)
+
+
+def main():
+    credentials = get_credentials()
+    service = build("content", "v2.1", credentials=credentials)
+    bq_client = bigquery.Client(project=BQ_PROJECT, credentials=credentials)
+
+    create_table(bq_client)
+
+    start = datetime.strptime(START_DATE, "%Y-%m-%d").date()
+    end = datetime.strptime(END_DATE, "%Y-%m-%d").date()
+    current = start
+    chunk_num = 1
+
+    while current <= end:
+        chunk_end = min(current + timedelta(days=CHUNK_DAYS - 1), end)
+        logger.info(f"Chunk {chunk_num}: {current.isoformat()} to {chunk_end.isoformat()}")
+
+        rows = fetch_data(service, current.isoformat(), chunk_end.isoformat())
+        if rows:
+            load_and_merge(bq_client, rows)
+        else:
+            logger.info("  No data for this chunk")
+
+        current = chunk_end + timedelta(days=1)
+        chunk_num += 1
+
+    logger.info("Backfill complete.")
+
+
+if __name__ == "__main__":
+    main()
