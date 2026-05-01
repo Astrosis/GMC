@@ -1,0 +1,326 @@
+"""
+GMC Content API → BigQuery Pipeline — Product-level (Cloud Function)
+
+Pulls MerchantPerformanceView with offer_id granularity and MERGEs
+directly into paid-search-fy26.GMC.GMC_report. No staging table.
+
+Deployment:
+    gcloud functions deploy gmc-product-sync --project=paid-search-fy26 --runtime python312 --trigger-http --entry-point main --timeout 540 --memory 512MB --region europe-west2 --service-account gmc-sync@paid-search-fy26.iam.gserviceaccount.com --set-env-vars MERCHANT_ID=120543441,BQ_PROJECT=paid-search-fy26,BQ_DATASET=GMC,BQ_TABLE=GMC_report
+
+Cloud Scheduler (daily at 6am UTC):
+    gcloud scheduler jobs create http gmc-product-daily --schedule "0 6 * * *" --uri "https://europe-west2-paid-search-fy26.cloudfunctions.net/gmc-product-sync" --http-method POST --oidc-service-account-email gmc-sync@paid-search-fy26.iam.gserviceaccount.com --time-zone "UTC"
+
+Backfill (one-time, run locally or via curl):
+    curl -X POST https://europe-west2-paid-search-fy26.cloudfunctions.net/gmc-product-sync -H "Authorization: bearer $(gcloud auth print-identity-token)" -H "Content-Type: application/json" -d '{"start_date": "2024-06-01", "end_date": "2026-04-30"}'
+
+    For large backfills, use chunked mode to avoid timeouts:
+    -d '{"start_date": "2024-06-01", "end_date": "2026-04-30", "chunk_days": 30}'
+
+Notes:
+    - Content API for Shopping sunsets August 18, 2026.
+    - Product-level data = much more rows than the aggregate table.
+      Timeout set to 540s and memory to 512MB accordingly.
+    - Chunked mode splits large date ranges into N-day batches,
+      each fetched and merged independently to avoid memory issues.
+"""
+
+import os
+import logging
+from datetime import date, datetime, timedelta
+
+import flask
+import functions_framework
+from google.auth import default as get_default_credentials
+from googleapiclient.discovery import build
+from google.cloud import bigquery
+
+# ──────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ──────────────────────────────────────────────────────────────────────
+MERCHANT_ID = os.environ.get("MERCHANT_ID", "120543441")
+BQ_PROJECT = os.environ.get("BQ_PROJECT", "paid-search-fy26")
+BQ_DATASET = os.environ.get("BQ_DATASET", "GMC")
+BQ_TABLE = os.environ.get("BQ_TABLE", "GMC_report")
+
+TARGET_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+
+SCOPES = [
+    "https://www.googleapis.com/auth/content",
+    "https://www.googleapis.com/auth/bigquery",
+]
+API_VERSION = "v2.1"
+PAGE_SIZE = 1000
+
+# ──────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Auth
+# ──────────────────────────────────────────────────────────────────────
+def get_credentials():
+    credentials, project = get_default_credentials(scopes=SCOPES)
+    return credentials
+
+
+def build_content_service(credentials):
+    return build("content", API_VERSION, credentials=credentials)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Fetch from Content API
+# ──────────────────────────────────────────────────────────────────────
+def fetch_performance_data(service, start_date: str, end_date: str) -> list[dict]:
+    """
+    Query MerchantPerformanceView with offer_id granularity.
+    Returns list of dicts with: date, program, country_code, offer_id,
+    impressions, clicks.
+    """
+    query = (
+        "SELECT "
+        "segments.date, "
+        "segments.program, "
+        "segments.customer_country_code, "
+        "segments.offer_id, "
+        "metrics.impressions, "
+        "metrics.clicks "
+        "FROM MerchantPerformanceView "
+        f"WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'"
+    )
+
+    logger.info(f"Querying Content API: {start_date} to {end_date}")
+
+    all_rows = []
+    page_token = None
+
+    while True:
+        request_body = {"query": query, "pageSize": PAGE_SIZE}
+        if page_token:
+            request_body["pageToken"] = page_token
+
+        response = (
+            service.reports()
+            .search(merchantId=MERCHANT_ID, body=request_body)
+            .execute()
+        )
+
+        results = response.get("results", [])
+
+        for row in results:
+            segments = row.get("segments", {})
+            metrics = row.get("metrics", {})
+
+            date_obj = segments.get("date", {})
+            row_date = (
+                f"{date_obj['year']}-{date_obj['month']:02d}-{date_obj['day']:02d}"
+            )
+
+            all_rows.append(
+                {
+                    "date": row_date,
+                    "program": segments.get("program", "UNKNOWN"),
+                    "country_code": segments.get("customerCountryCode", "UNKNOWN"),
+                    "offer_id": segments.get("offerId", "UNKNOWN"),
+                    "impressions": int(metrics.get("impressions", 0)),
+                    "clicks": int(metrics.get("clicks", 0)),
+                }
+            )
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+        logger.info(f"  Fetched {len(all_rows)} rows so far, paginating...")
+
+    logger.info(f"Total rows fetched: {len(all_rows)}")
+    return all_rows
+
+
+# ──────────────────────────────────────────────────────────────────────
+# BigQuery operations — no staging, direct temp table + MERGE
+# ──────────────────────────────────────────────────────────────────────
+TABLE_SCHEMA = [
+    bigquery.SchemaField("date", "DATE"),
+    bigquery.SchemaField("program", "STRING"),
+    bigquery.SchemaField("country_code", "STRING"),
+    bigquery.SchemaField("offer_id", "STRING"),
+    bigquery.SchemaField("impressions", "INTEGER"),
+    bigquery.SchemaField("clicks", "INTEGER"),
+]
+
+
+def ensure_target_table(bq_client):
+    """Create the target table if it doesn't exist."""
+    try:
+        bq_client.get_table(TARGET_TABLE)
+        logger.info(f"Target table exists: {TARGET_TABLE}")
+    except Exception:
+        table_ref = bigquery.Table(TARGET_TABLE, schema=TABLE_SCHEMA)
+        bq_client.create_table(table_ref)
+        logger.info(f"Created target table: {TARGET_TABLE}")
+
+
+def merge_rows(bq_client, rows: list[dict]):
+    """
+    Load rows into a temp table, MERGE into target, then drop temp.
+    No persistent staging table needed.
+    """
+    temp_table = f"{BQ_PROJECT}.{BQ_DATASET}._temp_gmc_report_{date.today().strftime('%Y%m%d')}"
+
+    # Load to temp
+    logger.info(f"Loading {len(rows)} rows to temp table: {temp_table}")
+    job_config = bigquery.LoadJobConfig(
+        schema=TABLE_SCHEMA,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+    )
+    job = bq_client.load_table_from_json(rows, temp_table, job_config=job_config)
+    job.result()
+    logger.info(f"Temp load complete: {job.output_rows} rows")
+
+    # MERGE
+    merge_sql = f"""
+    MERGE `{TARGET_TABLE}` AS target
+    USING `{temp_table}` AS source
+    ON target.date = source.date
+       AND target.program = source.program
+       AND target.country_code = source.country_code
+       AND target.offer_id = source.offer_id
+    WHEN MATCHED THEN
+        UPDATE SET
+            clicks = source.clicks,
+            impressions = source.impressions
+    WHEN NOT MATCHED THEN
+        INSERT (date, program, country_code, offer_id, clicks, impressions)
+        VALUES (source.date, source.program, source.country_code,
+                source.offer_id, source.clicks, source.impressions)
+    """
+
+    logger.info("Running MERGE...")
+    query_job = bq_client.query(merge_sql)
+    query_job.result()
+    dml = query_job.num_dml_affected_rows
+    logger.info(f"MERGE complete. Rows affected: {dml}")
+
+    # Drop temp
+    bq_client.delete_table(temp_table, not_found_ok=True)
+    logger.info(f"Temp table dropped: {temp_table}")
+
+    return dml
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Pipeline orchestration
+# ──────────────────────────────────────────────────────────────────────
+def date_range_chunks(start_date: str, end_date: str, chunk_days: int):
+    """Yield (chunk_start, chunk_end) date string pairs."""
+    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+    current = start
+    while current <= end:
+        chunk_end = min(current + timedelta(days=chunk_days - 1), end)
+        yield current.isoformat(), chunk_end.isoformat()
+        current = chunk_end + timedelta(days=1)
+
+
+def run_pipeline(start_date: str, end_date: str, chunk_days: int = 0) -> dict:
+    """
+    Execute the full pipeline.
+    If chunk_days > 0, splits the range into chunks to avoid
+    memory/timeout issues on large backfills.
+    """
+    credentials = get_credentials()
+    service = build_content_service(credentials)
+    bq_client = bigquery.Client(project=BQ_PROJECT, credentials=credentials)
+
+    ensure_target_table(bq_client)
+
+    total_fetched = 0
+    total_merged = 0
+
+    if chunk_days > 0:
+        chunks = list(date_range_chunks(start_date, end_date, chunk_days))
+        logger.info(f"Chunked mode: {len(chunks)} chunks of {chunk_days} days")
+
+        for i, (cs, ce) in enumerate(chunks, 1):
+            logger.info(f"Chunk {i}/{len(chunks)}: {cs} to {ce}")
+            rows = fetch_performance_data(service, cs, ce)
+            if rows:
+                dml = merge_rows(bq_client, rows)
+                total_fetched += len(rows)
+                total_merged += dml
+            else:
+                logger.info(f"  No data for chunk {cs} to {ce}")
+    else:
+        rows = fetch_performance_data(service, start_date, end_date)
+        if rows:
+            total_fetched = len(rows)
+            total_merged = merge_rows(bq_client, rows)
+
+    if total_fetched == 0:
+        logger.warning("No data returned from API.")
+        return {
+            "status": "no_data",
+            "start_date": start_date,
+            "end_date": end_date,
+            "rows_fetched": 0,
+        }
+
+    return {
+        "status": "success",
+        "start_date": start_date,
+        "end_date": end_date,
+        "rows_fetched": total_fetched,
+        "rows_merged": total_merged,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Cloud Function entry point
+# ──────────────────────────────────────────────────────────────────────
+@functions_framework.http
+def main(request: flask.Request) -> flask.Response:
+    """
+    HTTP Cloud Function entry point.
+
+    Default (no body): pulls yesterday's data.
+    With JSON body:
+        {"start_date": "2024-06-01", "end_date": "2026-04-30"}
+        {"start_date": "2024-06-01", "end_date": "2026-04-30", "chunk_days": 30}
+        {"days": 3}
+    """
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+
+    if "days" in body:
+        days = int(body["days"])
+        end_date = yesterday
+        start_date = (date.today() - timedelta(days=days)).isoformat()
+    else:
+        start_date = body.get("start_date", yesterday)
+        end_date = body.get("end_date", yesterday)
+
+    chunk_days = int(body.get("chunk_days", 0))
+
+    logger.info(f"Triggered. Range: {start_date} to {end_date}, chunk_days: {chunk_days}")
+
+    try:
+        result = run_pipeline(start_date, end_date, chunk_days)
+        logger.info(f"Result: {result}")
+        return flask.jsonify(result), 200
+
+    except Exception as e:
+        logger.error(f"Pipeline failed: {str(e)}", exc_info=True)
+        return flask.jsonify({"status": "error", "message": str(e)}), 500
