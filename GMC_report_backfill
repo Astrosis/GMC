@@ -12,6 +12,9 @@ from googleapiclient.discovery import build
 from google.cloud import bigquery
 from datetime import date, datetime, timedelta
 import logging
+import time
+import httplib2
+import google_auth_httplib2
 
 # ──────────────────────────────────────────────────────────────────────
 # CONFIG — update these
@@ -26,7 +29,7 @@ TARGET_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 # Backfill range
 START_DATE = "2024-06-01"
 END_DATE = date.today().isoformat()
-CHUNK_DAYS = 30
+CHUNK_DAYS = 7
 
 # ──────────────────────────────────────────────────────────────────────
 SCOPES = [
@@ -46,7 +49,7 @@ TABLE_SCHEMA = [
     bigquery.SchemaField("date", "DATE"),
     bigquery.SchemaField("program", "STRING"),
     bigquery.SchemaField("country_code", "STRING"),
-    bigquery.SchemaField("offer_id", "STRING"),
+    bigquery.SchemaField("id", "STRING"),
     bigquery.SchemaField("impressions", "INTEGER"),
     bigquery.SchemaField("clicks", "INTEGER"),
 ]
@@ -56,6 +59,12 @@ def get_credentials():
     return service_account.Credentials.from_service_account_file(
         SERVICE_ACCOUNT_KEY, scopes=SCOPES
     )
+
+
+def build_service(credentials):
+    http = httplib2.Http(timeout=120)
+    http = google_auth_httplib2.AuthorizedHttp(credentials, http=http)
+    return build("content", "v2.1", http=http)
 
 
 def create_table(bq_client):
@@ -68,7 +77,7 @@ def create_table(bq_client):
         logger.info(f"Created table: {TARGET_TABLE}")
 
 
-def fetch_data(service, start_date, end_date):
+def fetch_data(service, credentials, start_date, end_date, max_retries=3):
     query = (
         "SELECT "
         "segments.date, "
@@ -91,11 +100,23 @@ def fetch_data(service, start_date, end_date):
         if page_token:
             request_body["pageToken"] = page_token
 
-        response = (
-            service.reports()
-            .search(merchantId=MERCHANT_ID, body=request_body)
-            .execute()
-        )
+        for attempt in range(max_retries):
+            try:
+                response = (
+                    service.reports()
+                    .search(merchantId=MERCHANT_ID, body=request_body)
+                    .execute()
+                )
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = 10 * (attempt + 1)
+                    logger.warning(f"  Attempt {attempt + 1} failed: {e}. Retrying in {wait}s...")
+                    time.sleep(wait)
+                    # Rebuild service with fresh connection
+                    service = build_service(credentials)
+                else:
+                    raise
 
         for row in response.get("results", []):
             segments = row.get("segments", {})
@@ -107,7 +128,7 @@ def fetch_data(service, start_date, end_date):
                 "date": row_date,
                 "program": segments.get("program", "UNKNOWN"),
                 "country_code": segments.get("customerCountryCode", "UNKNOWN"),
-                "offer_id": segments.get("offerId", "UNKNOWN"),
+                "id": segments.get("offerId", "UNKNOWN"),
                 "impressions": int(metrics.get("impressions", 0)),
                 "clicks": int(metrics.get("clicks", 0)),
             })
@@ -138,15 +159,15 @@ def load_and_merge(bq_client, rows):
     ON target.date = source.date
        AND target.program = source.program
        AND target.country_code = source.country_code
-       AND target.offer_id = source.offer_id
+       AND target.id = source.id
     WHEN MATCHED THEN
         UPDATE SET
             clicks = source.clicks,
             impressions = source.impressions
     WHEN NOT MATCHED THEN
-        INSERT (date, program, country_code, offer_id, clicks, impressions)
+        INSERT (date, program, country_code, id, clicks, impressions)
         VALUES (source.date, source.program, source.country_code,
-                source.offer_id, source.clicks, source.impressions)
+                source.id, source.clicks, source.impressions)
     """
 
     query_job = bq_client.query(merge_sql)
@@ -158,7 +179,7 @@ def load_and_merge(bq_client, rows):
 
 def main():
     credentials = get_credentials()
-    service = build("content", "v2.1", credentials=credentials)
+    service = build_service(credentials)
     bq_client = bigquery.Client(project=BQ_PROJECT, credentials=credentials)
 
     create_table(bq_client)
@@ -172,7 +193,7 @@ def main():
         chunk_end = min(current + timedelta(days=CHUNK_DAYS - 1), end)
         logger.info(f"Chunk {chunk_num}: {current.isoformat()} to {chunk_end.isoformat()}")
 
-        rows = fetch_data(service, current.isoformat(), chunk_end.isoformat())
+        rows = fetch_data(service, credentials, current.isoformat(), chunk_end.isoformat())
         if rows:
             load_and_merge(bq_client, rows)
         else:
