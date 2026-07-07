@@ -41,6 +41,9 @@ Notes:
     - Content API for Shopping sunsets in 2026; the Merchant API is the
       replacement. Verify the exact reports version (reports_v1beta vs the
       now-GA reports_v1) via the discovery doc and bump API_VERSION if needed.
+    - Location filter: pull a single country by setting the LOCATION env var
+      (e.g. add LOCATION=GB to --set-env-vars) or per-request with
+      {"location": "GB"}. Empty/unset = all countries.
     - Product-level data = much more rows than the aggregate table.
       Timeout set to 540s and memory to 512MB accordingly.
     - Chunked mode splits large date ranges into N-day batches,
@@ -64,6 +67,11 @@ MERCHANT_ID = os.environ.get("MERCHANT_ID", "120543441")
 BQ_PROJECT = os.environ.get("BQ_PROJECT", "paid-search-fy26")
 BQ_DATASET = os.environ.get("BQ_DATASET", "GMC")
 BQ_TABLE = os.environ.get("BQ_TABLE", "GMC_report_mapi")
+
+# Optional location filter. When set to a country code (e.g. "GB", "US"),
+# the query is restricted to that customer_country_code. Empty = all
+# countries. Overridable per-request via {"location": "GB"} in the body.
+LOCATION = os.environ.get("LOCATION", "").strip().upper()
 
 TARGET_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
@@ -128,7 +136,9 @@ def map_program(marketing_method: str) -> str:
 # ──────────────────────────────────────────────────────────────────────
 # Fetch from Merchant API (Reports)
 # ──────────────────────────────────────────────────────────────────────
-def fetch_performance_data(service, start_date: str, end_date: str) -> list[dict]:
+def fetch_performance_data(
+    service, start_date: str, end_date: str, location: str = ""
+) -> list[dict]:
     """
     Query product_performance_view with offer_id granularity.
     Returns list of dicts with: date, program, country_code, offer_id,
@@ -138,7 +148,16 @@ def fetch_performance_data(service, start_date: str, end_date: str) -> list[dict
       - FROM product_performance_view (snake_case view name)
       - flat field names, no segments./metrics. prefixes
       - a query selecting segment fields must also select >=1 metric
+
+    If `location` (a country code like "GB") is given, the query is
+    restricted to that customer_country_code.
     """
+    where = f"WHERE date BETWEEN '{start_date}' AND '{end_date}'"
+    if location:
+        # customer_country_code is a segment on product_performance_view and
+        # is filterable in WHERE. Uppercase 2-letter code, e.g. GB / US.
+        where += f" AND customer_country_code = '{location}'"
+
     query = (
         "SELECT "
         "date, "
@@ -148,10 +167,11 @@ def fetch_performance_data(service, start_date: str, end_date: str) -> list[dict
         "impressions, "
         "clicks "
         "FROM product_performance_view "
-        f"WHERE date BETWEEN '{start_date}' AND '{end_date}'"
+        f"{where}"
     )
 
-    logger.info(f"Querying Merchant API: {start_date} to {end_date}")
+    loc_note = f", location={location}" if location else ""
+    logger.info(f"Querying Merchant API: {start_date} to {end_date}{loc_note}")
 
     all_rows = []
     page_token = None
@@ -292,11 +312,14 @@ def date_range_chunks(start_date: str, end_date: str, chunk_days: int):
         current = chunk_end + timedelta(days=1)
 
 
-def run_pipeline(start_date: str, end_date: str, chunk_days: int = 0) -> dict:
+def run_pipeline(
+    start_date: str, end_date: str, chunk_days: int = 0, location: str = ""
+) -> dict:
     """
     Execute the full pipeline.
     If chunk_days > 0, splits the range into chunks to avoid
     memory/timeout issues on large backfills.
+    If location (a country code) is given, restricts the pull to it.
     """
     credentials = get_credentials()
     service = build_reports_service(credentials)
@@ -313,7 +336,7 @@ def run_pipeline(start_date: str, end_date: str, chunk_days: int = 0) -> dict:
 
         for i, (cs, ce) in enumerate(chunks, 1):
             logger.info(f"Chunk {i}/{len(chunks)}: {cs} to {ce}")
-            rows = fetch_performance_data(service, cs, ce)
+            rows = fetch_performance_data(service, cs, ce, location)
             if rows:
                 dml = merge_rows(bq_client, rows)
                 total_fetched += len(rows)
@@ -321,7 +344,7 @@ def run_pipeline(start_date: str, end_date: str, chunk_days: int = 0) -> dict:
             else:
                 logger.info(f"  No data for chunk {cs} to {ce}")
     else:
-        rows = fetch_performance_data(service, start_date, end_date)
+        rows = fetch_performance_data(service, start_date, end_date, location)
         if rows:
             total_fetched = len(rows)
             total_merged = merge_rows(bq_client, rows)
@@ -332,6 +355,7 @@ def run_pipeline(start_date: str, end_date: str, chunk_days: int = 0) -> dict:
             "status": "no_data",
             "start_date": start_date,
             "end_date": end_date,
+            "location": location or "ALL",
             "rows_fetched": 0,
         }
 
@@ -339,6 +363,7 @@ def run_pipeline(start_date: str, end_date: str, chunk_days: int = 0) -> dict:
         "status": "success",
         "start_date": start_date,
         "end_date": end_date,
+        "location": location or "ALL",
         "rows_fetched": total_fetched,
         "rows_merged": total_merged,
     }
@@ -357,6 +382,7 @@ def main(request: flask.Request) -> flask.Response:
         {"start_date": "2024-06-01", "end_date": "2026-04-30"}
         {"start_date": "2024-06-01", "end_date": "2026-04-30", "chunk_days": 30}
         {"days": 3}
+        {"days": 3, "location": "GB"}   # restrict to one country
     """
     yesterday = (date.today() - timedelta(days=1)).isoformat()
 
@@ -374,11 +400,16 @@ def main(request: flask.Request) -> flask.Response:
         end_date = body.get("end_date", yesterday)
 
     chunk_days = int(body.get("chunk_days", 0))
+    # Per-request location overrides the LOCATION env default; empty = all.
+    location = str(body.get("location", LOCATION)).strip().upper()
 
-    logger.info(f"Triggered. Range: {start_date} to {end_date}, chunk_days: {chunk_days}")
+    logger.info(
+        f"Triggered. Range: {start_date} to {end_date}, "
+        f"chunk_days: {chunk_days}, location: {location or 'ALL'}"
+    )
 
     try:
-        result = run_pipeline(start_date, end_date, chunk_days)
+        result = run_pipeline(start_date, end_date, chunk_days, location)
         logger.info(f"Result: {result}")
         return flask.jsonify(result), 200
 
