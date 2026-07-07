@@ -9,6 +9,10 @@ registered with the Merchant Center account (401 UNAUTHENTICATED,
 one-time registration in Python, so you don't have to fight Windows shell
 quoting with curl.
 
+
+gcloud auth application-default login --scopes=openid,https://www.googleapis.com/auth/content,https://www.googleapis.com/auth/cloud-platform
+
+
 Run it ONCE per GCP project, against the PARENT advanced account — that
 registration automatically covers every sub-account (.com, .jp, ...).
 
