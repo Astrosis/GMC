@@ -87,9 +87,10 @@ SCOPES = [
 API_SERVICE = "merchantapi"
 API_VERSION = os.environ.get("MERCHANT_API_VERSION", "reports_v1")
 
-# Parent resource for account-scoped calls: accounts/{account_id}
-ACCOUNT_PARENT = f"accounts/{MERCHANT_ID}"
-
+# Default sub-account to pull. MERCHANT_ID is the SUB-account whose product
+# data you want (e.g. the .com or .jp sub-account), NOT the parent advanced
+# account. Developer registration is done once on the PARENT advanced account
+# and covers all sub-accounts. Override per-request with {"merchant_id": "..."}.
 PAGE_SIZE = 1000
 
 # ──────────────────────────────────────────────────────────────────────
@@ -137,12 +138,12 @@ def map_program(marketing_method: str) -> str:
 # Fetch from Merchant API (Reports)
 # ──────────────────────────────────────────────────────────────────────
 def fetch_performance_data(
-    service, start_date: str, end_date: str, location: str = ""
+    service, merchant_id: str, start_date: str, end_date: str, location: str = ""
 ) -> list[dict]:
     """
-    Query product_performance_view with offer_id granularity.
-    Returns list of dicts with: date, program, country_code, offer_id,
-    impressions, clicks.
+    Query product_performance_view with offer_id granularity for one
+    sub-account (merchant_id). Returns list of dicts with: account_id, date,
+    program, country_code, offer_id, impressions, clicks.
 
     Merchant API query language differs from the Content API:
       - FROM product_performance_view (snake_case view name)
@@ -171,7 +172,10 @@ def fetch_performance_data(
     )
 
     loc_note = f", location={location}" if location else ""
-    logger.info(f"Querying Merchant API: {start_date} to {end_date}{loc_note}")
+    logger.info(
+        f"Querying Merchant API [account {merchant_id}]: "
+        f"{start_date} to {end_date}{loc_note}"
+    )
 
     all_rows = []
     page_token = None
@@ -184,7 +188,7 @@ def fetch_performance_data(
         response = (
             service.accounts()
             .reports()
-            .search(parent=ACCOUNT_PARENT, body=request_body)
+            .search(parent=f"accounts/{merchant_id}", body=request_body)
             .execute()
         )
 
@@ -202,6 +206,7 @@ def fetch_performance_data(
 
             all_rows.append(
                 {
+                    "account_id": merchant_id,
                     "date": row_date,
                     "program": map_program(view.get("marketingMethod", "")),
                     "country_code": view.get("customerCountryCode", "UNKNOWN"),
@@ -226,6 +231,9 @@ def fetch_performance_data(
 # BigQuery operations — no staging, direct temp table + MERGE
 # ──────────────────────────────────────────────────────────────────────
 TABLE_SCHEMA = [
+    # account_id = the sub-account the row came from. Part of the MERGE key so
+    # .com and .jp data can share one table without overwriting each other.
+    bigquery.SchemaField("account_id", "STRING"),
     bigquery.SchemaField("date", "DATE"),
     bigquery.SchemaField("program", "STRING"),
     bigquery.SchemaField("country_code", "STRING"),
@@ -246,14 +254,18 @@ def ensure_target_table(bq_client):
         logger.info(f"Created target table: {TARGET_TABLE}")
 
 
-def merge_rows(bq_client, rows: list[dict]):
+def merge_rows(bq_client, rows: list[dict], merchant_id: str):
     """
     Load rows into a temp table, MERGE into target, then drop temp.
     No persistent staging table needed.
     """
-    # Temp name scoped to THIS target table so the parallel Content API
-    # pipeline's temp table (also per-day) can't truncate ours mid-flight.
-    temp_table = f"{BQ_PROJECT}.{BQ_DATASET}._temp_{BQ_TABLE}_{date.today().strftime('%Y%m%d')}"
+    # Temp name scoped to THIS target table AND sub-account, so neither the
+    # parallel Content API pipeline nor a concurrent sub-account run (e.g. .jp
+    # firing at the same 6am as .com) can truncate our temp table mid-flight.
+    temp_table = (
+        f"{BQ_PROJECT}.{BQ_DATASET}._temp_{BQ_TABLE}_{merchant_id}_"
+        f"{date.today().strftime('%Y%m%d')}"
+    )
 
     # Load to temp
     logger.info(f"Loading {len(rows)} rows to temp table: {temp_table}")
@@ -270,7 +282,8 @@ def merge_rows(bq_client, rows: list[dict]):
     merge_sql = f"""
     MERGE `{TARGET_TABLE}` AS target
     USING `{temp_table}` AS source
-    ON target.date = source.date
+    ON target.account_id = source.account_id
+       AND target.date = source.date
        AND target.program = source.program
        AND target.country_code = source.country_code
        AND target.offer_id = source.offer_id
@@ -279,8 +292,8 @@ def merge_rows(bq_client, rows: list[dict]):
             clicks = source.clicks,
             impressions = source.impressions
     WHEN NOT MATCHED THEN
-        INSERT (date, program, country_code, offer_id, clicks, impressions)
-        VALUES (source.date, source.program, source.country_code,
+        INSERT (account_id, date, program, country_code, offer_id, clicks, impressions)
+        VALUES (source.account_id, source.date, source.program, source.country_code,
                 source.offer_id, source.clicks, source.impressions)
     """
 
@@ -313,10 +326,14 @@ def date_range_chunks(start_date: str, end_date: str, chunk_days: int):
 
 
 def run_pipeline(
-    start_date: str, end_date: str, chunk_days: int = 0, location: str = ""
+    merchant_id: str,
+    start_date: str,
+    end_date: str,
+    chunk_days: int = 0,
+    location: str = "",
 ) -> dict:
     """
-    Execute the full pipeline.
+    Execute the full pipeline for one sub-account (merchant_id).
     If chunk_days > 0, splits the range into chunks to avoid
     memory/timeout issues on large backfills.
     If location (a country code) is given, restricts the pull to it.
@@ -336,23 +353,26 @@ def run_pipeline(
 
         for i, (cs, ce) in enumerate(chunks, 1):
             logger.info(f"Chunk {i}/{len(chunks)}: {cs} to {ce}")
-            rows = fetch_performance_data(service, cs, ce, location)
+            rows = fetch_performance_data(service, merchant_id, cs, ce, location)
             if rows:
-                dml = merge_rows(bq_client, rows)
+                dml = merge_rows(bq_client, rows, merchant_id)
                 total_fetched += len(rows)
                 total_merged += dml
             else:
                 logger.info(f"  No data for chunk {cs} to {ce}")
     else:
-        rows = fetch_performance_data(service, start_date, end_date, location)
+        rows = fetch_performance_data(
+            service, merchant_id, start_date, end_date, location
+        )
         if rows:
             total_fetched = len(rows)
-            total_merged = merge_rows(bq_client, rows)
+            total_merged = merge_rows(bq_client, rows, merchant_id)
 
     if total_fetched == 0:
         logger.warning("No data returned from API.")
         return {
             "status": "no_data",
+            "account_id": merchant_id,
             "start_date": start_date,
             "end_date": end_date,
             "location": location or "ALL",
@@ -361,6 +381,7 @@ def run_pipeline(
 
     return {
         "status": "success",
+        "account_id": merchant_id,
         "start_date": start_date,
         "end_date": end_date,
         "location": location or "ALL",
@@ -383,6 +404,7 @@ def main(request: flask.Request) -> flask.Response:
         {"start_date": "2024-06-01", "end_date": "2026-04-30", "chunk_days": 30}
         {"days": 3}
         {"days": 3, "location": "GB"}   # restrict to one country
+        {"days": 3, "merchant_id": "<jp_subaccount>"}  # pull a sub-account
     """
     yesterday = (date.today() - timedelta(days=1)).isoformat()
 
@@ -402,14 +424,16 @@ def main(request: flask.Request) -> flask.Response:
     chunk_days = int(body.get("chunk_days", 0))
     # Per-request location overrides the LOCATION env default; empty = all.
     location = str(body.get("location", LOCATION)).strip().upper()
+    # Per-request sub-account overrides the MERCHANT_ID env default.
+    merchant_id = str(body.get("merchant_id", MERCHANT_ID)).strip()
 
     logger.info(
-        f"Triggered. Range: {start_date} to {end_date}, "
+        f"Triggered. Account: {merchant_id}, Range: {start_date} to {end_date}, "
         f"chunk_days: {chunk_days}, location: {location or 'ALL'}"
     )
 
     try:
-        result = run_pipeline(start_date, end_date, chunk_days, location)
+        result = run_pipeline(merchant_id, start_date, end_date, chunk_days, location)
         logger.info(f"Result: {result}")
         return flask.jsonify(result), 200
 
