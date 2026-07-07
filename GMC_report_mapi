@@ -15,7 +15,7 @@ PARALLEL-RUN NOTE:
 MIGRATION NOTE (Content API for Shopping → Merchant API):
     The legacy Content API for Shopping ("content" v2.1) is being sunset.
     This script targets the Merchant API Reports sub-API instead:
-        - service:  build("merchantapi", "reports_v1beta")
+        - service:  build("merchantapi", "reports_v1")
         - method:   accounts().reports().search(parent="accounts/{id}", body=...)
         - view:     product_performance_view   (was MerchantPerformanceView)
         - query:    flat field names, no segments./metrics. prefixes
@@ -39,8 +39,8 @@ Backfill (one-time, run locally or via curl):
 
 Notes:
     - Content API for Shopping sunsets in 2026; the Merchant API is the
-      replacement. Verify the exact reports version (reports_v1beta vs the
-      now-GA reports_v1) via the discovery doc and bump API_VERSION if needed.
+      replacement. Uses the GA reports_v1 sub-API (reports_v1beta has been
+      discontinued). Override with the MERCHANT_API_VERSION env var if needed.
     - Location filter: pull a single country by setting the LOCATION env var
       (e.g. add LOCATION=GB to --set-env-vars) or per-request with
       {"location": "GB"}. Empty/unset = all countries.
@@ -82,10 +82,10 @@ SCOPES = [
 ]
 
 # Merchant API is split into sub-APIs, each with its own version.
-# Reporting lives in the "reports" sub-API. reports_v1 is now GA; reports_v1beta
-# is still published. Change API_VERSION here if you want the GA endpoint.
+# Reporting lives in the "reports" sub-API. reports_v1 is GA; the older
+# reports_v1beta has been discontinued. Override via env var only if needed.
 API_SERVICE = "merchantapi"
-API_VERSION = os.environ.get("MERCHANT_API_VERSION", "reports_v1beta")
+API_VERSION = os.environ.get("MERCHANT_API_VERSION", "reports_v1")
 
 # Parent resource for account-scoped calls: accounts/{account_id}
 ACCOUNT_PARENT = f"accounts/{MERCHANT_ID}"
