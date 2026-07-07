@@ -1,6 +1,8 @@
 """
 register_gcp — one-time Merchant API developer registration.
-
+  File "C:\Users\kngo\AppData\Local\Programs\Python\Python313\Lib\site-packages\google\auth\impersonated_credentials.py", line 103, in _make_iam_token_request
+    raise exceptions.RefreshError(_REFRESH_ERROR, response_body)
+google.auth.exceptions.RefreshError: ('Unable to acquire impersonated credentials', '{\n  "error": {\n    "code": 403,\n    "message": "Permission \'iam.serviceAccounts.getAccessToken\' denied on resource (or it may not exist). Remediate access with this Troubleshooter URL or share it with your administrator - https://console.cloud.google.com/iam-admin/troubleshooter/summary;errorId=CiQwMTlmM2U1OC01N2VhLTc2NjQtYjIyMy1jODNjOGQ2OWIxOWUSAA%3D%3D .",\n    "status": "PERMISSION_DENIED",\n    "details": [\n      {\n        "@type": "type.googleapis.com/google.rpc.ErrorInfo",\n        "reason": "IAM_PERMISSION_DENIED",\n        "domain": "iam.googleapis.com",\n        "metadata": {\n          "permission": "iam.serviceAccounts.getAccessToken",\n          "error_info_id": "CiQwMTlmM2U1OC01N2VhLTc2NjQtYjIyMy1jODNjOGQ2OWIxOWUSAA==",\n          "troubleshooter_url": "https://console.cloud.google.com/iam-admin/troubleshooter/summary;errorId=CiQwMTlmM2U1OC01N2VhLTc2NjQtYjIyMy1jODNjOGQ2OWIxOWUSAA%3D%3D"\n        }\n      }\n    ]\n  }\n}\n')
 The Merchant API blocks any call from a GCP project that hasn't been
 registered with the Merchant Center account (401 UNAUTHENTICATED,
 "...is not registered with the merchant account"). This script performs that
