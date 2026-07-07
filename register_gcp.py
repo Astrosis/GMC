@@ -10,7 +10,7 @@ one-time registration in Python, so you don't have to fight Windows shell
 quoting with curl.
 
 
-gcloud auth application-default login --scopes=openid,https://www.googleapis.com/auth/content,https://www.googleapis.com/auth/cloud-platform
+gcloud iam service-accounts add-iam-policy-binding <SA_EMAIL> --member="user:kevin.ngo@abcam.com" --role="roles/iam.serviceAccountTokenCreator"
 
 
 Run it ONCE per GCP project, against the PARENT advanced account — that
