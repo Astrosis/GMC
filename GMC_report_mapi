@@ -1,0 +1,387 @@
+"""
+GMC Merchant API → BigQuery Pipeline — Product-level (Cloud Function)
+
+Pulls product_performance_view with offer_id granularity via the new
+Merchant API (Reports sub-API) and MERGEs directly into
+paid-search-fy26.GMC.GMC_report_mapi. No staging table.
+
+PARALLEL-RUN NOTE:
+    This is a SEPARATE pipeline from the existing Content API function.
+    It writes to its own table (GMC_report_mapi) with its own function name
+    and scheduler job, so it runs alongside the old one without touching
+    GMC_report. Diff the two tables to measure the discrepancy, then retire
+    the Content API pipeline once you're satisfied they agree.
+
+MIGRATION NOTE (Content API for Shopping → Merchant API):
+    The legacy Content API for Shopping ("content" v2.1) is being sunset.
+    This script targets the Merchant API Reports sub-API instead:
+        - service:  build("merchantapi", "reports_v1beta")
+        - method:   accounts().reports().search(parent="accounts/{id}", body=...)
+        - view:     product_performance_view   (was MerchantPerformanceView)
+        - query:    flat field names, no segments./metrics. prefixes
+        - response: row["productPerformanceView"]  (was segments/metrics)
+        - `program` is REPLACED by `marketing_method` (ADS / ORGANIC),
+          which uses a DIFFERENT value set than the old `program`
+          (SHOPPING_ADS / FREE_PRODUCT_LISTING / ...). See map_program() below.
+    OAuth scope is unchanged (.../auth/content).
+
+Deployment (distinct name/table so it runs parallel to the Content API job):
+    gcloud functions deploy gmc-product-sync-mapi --project=paid-search-fy26 --runtime python312 --trigger-http --entry-point main --timeout 540 --memory 512MB --region europe-west2 --service-account gmc-sync@paid-search-fy26.iam.gserviceaccount.com --set-env-vars MERCHANT_ID=120543441,BQ_PROJECT=paid-search-fy26,BQ_DATASET=GMC,BQ_TABLE=GMC_report_mapi
+
+Cloud Scheduler (daily at 6am UTC):
+    gcloud scheduler jobs create http gmc-product-mapi-daily --schedule "0 6 * * *" --uri "https://europe-west2-paid-search-fy26.cloudfunctions.net/gmc-product-sync-mapi" --http-method POST --oidc-service-account-email gmc-sync@paid-search-fy26.iam.gserviceaccount.com --time-zone "UTC"
+
+Backfill (one-time, run locally or via curl):
+    curl -X POST https://europe-west2-paid-search-fy26.cloudfunctions.net/gmc-product-sync-mapi -H "Authorization: bearer $(gcloud auth print-identity-token)" -H "Content-Type: application/json" -d '{"start_date": "2024-06-01", "end_date": "2026-04-30"}'
+
+    For large backfills, use chunked mode to avoid timeouts:
+    -d '{"start_date": "2024-06-01", "end_date": "2026-04-30", "chunk_days": 30}'
+
+Notes:
+    - Content API for Shopping sunsets in 2026; the Merchant API is the
+      replacement. Verify the exact reports version (reports_v1beta vs the
+      now-GA reports_v1) via the discovery doc and bump API_VERSION if needed.
+    - Product-level data = much more rows than the aggregate table.
+      Timeout set to 540s and memory to 512MB accordingly.
+    - Chunked mode splits large date ranges into N-day batches,
+      each fetched and merged independently to avoid memory issues.
+"""
+
+import os
+import logging
+from datetime import date, datetime, timedelta
+
+import flask
+import functions_framework
+from google.auth import default as get_default_credentials
+from googleapiclient.discovery import build
+from google.cloud import bigquery
+
+# ──────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ──────────────────────────────────────────────────────────────────────
+MERCHANT_ID = os.environ.get("MERCHANT_ID", "120543441")
+BQ_PROJECT = os.environ.get("BQ_PROJECT", "paid-search-fy26")
+BQ_DATASET = os.environ.get("BQ_DATASET", "GMC")
+BQ_TABLE = os.environ.get("BQ_TABLE", "GMC_report_mapi")
+
+TARGET_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+
+# Merchant API uses the same OAuth scope as the old Content API.
+SCOPES = [
+    "https://www.googleapis.com/auth/content",
+    "https://www.googleapis.com/auth/bigquery",
+]
+
+# Merchant API is split into sub-APIs, each with its own version.
+# Reporting lives in the "reports" sub-API. reports_v1 is now GA; reports_v1beta
+# is still published. Change API_VERSION here if you want the GA endpoint.
+API_SERVICE = "merchantapi"
+API_VERSION = os.environ.get("MERCHANT_API_VERSION", "reports_v1beta")
+
+# Parent resource for account-scoped calls: accounts/{account_id}
+ACCOUNT_PARENT = f"accounts/{MERCHANT_ID}"
+
+PAGE_SIZE = 1000
+
+# ──────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Auth
+# ──────────────────────────────────────────────────────────────────────
+def get_credentials():
+    credentials, project = get_default_credentials(scopes=SCOPES)
+    return credentials
+
+
+def build_reports_service(credentials):
+    # Merchant API Reports sub-API (replaces the Content API "content" service).
+    return build(API_SERVICE, API_VERSION, credentials=credentials)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# program vs marketing_method mapping
+# ──────────────────────────────────────────────────────────────────────
+# The old Content API had segments.program with values like SHOPPING_ADS,
+# FREE_PRODUCT_LISTING, FREE_LOCAL_PRODUCT_LISTING, BUY_ON_GOOGLE_LISTING.
+# The Merchant API replaces this with marketing_method: ADS / ORGANIC.
+# We keep the BigQuery column named `program` for downstream compatibility,
+# but its VALUES change after cutover. Adjust this mapping if you want new
+# rows to look like the historical ones (or normalize the history instead).
+def map_program(marketing_method: str) -> str:
+    # Pass through the new values as-is by default. If you prefer to coerce
+    # to the old vocabulary, do it here, e.g.:
+    #   return {"ADS": "SHOPPING_ADS", "ORGANIC": "FREE_PRODUCT_LISTING"}.get(
+    #       marketing_method, marketing_method)
+    return marketing_method or "UNKNOWN"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Fetch from Merchant API (Reports)
+# ──────────────────────────────────────────────────────────────────────
+def fetch_performance_data(service, start_date: str, end_date: str) -> list[dict]:
+    """
+    Query product_performance_view with offer_id granularity.
+    Returns list of dicts with: date, program, country_code, offer_id,
+    impressions, clicks.
+
+    Merchant API query language differs from the Content API:
+      - FROM product_performance_view (snake_case view name)
+      - flat field names, no segments./metrics. prefixes
+      - a query selecting segment fields must also select >=1 metric
+    """
+    query = (
+        "SELECT "
+        "date, "
+        "marketing_method, "
+        "customer_country_code, "
+        "offer_id, "
+        "impressions, "
+        "clicks "
+        "FROM product_performance_view "
+        f"WHERE date BETWEEN '{start_date}' AND '{end_date}'"
+    )
+
+    logger.info(f"Querying Merchant API: {start_date} to {end_date}")
+
+    all_rows = []
+    page_token = None
+
+    while True:
+        request_body = {"query": query, "pageSize": PAGE_SIZE}
+        if page_token:
+            request_body["pageToken"] = page_token
+
+        response = (
+            service.accounts()
+            .reports()
+            .search(parent=ACCOUNT_PARENT, body=request_body)
+            .execute()
+        )
+
+        results = response.get("results", [])
+
+        for row in results:
+            # In the Merchant API, each ReportRow carries the data under a
+            # camelCase field named after the view: productPerformanceView.
+            view = row.get("productPerformanceView", {})
+
+            date_obj = view.get("date", {})
+            row_date = (
+                f"{date_obj['year']}-{date_obj['month']:02d}-{date_obj['day']:02d}"
+            )
+
+            all_rows.append(
+                {
+                    "date": row_date,
+                    "program": map_program(view.get("marketingMethod", "")),
+                    "country_code": view.get("customerCountryCode", "UNKNOWN"),
+                    "offer_id": view.get("offerId", "UNKNOWN"),
+                    # int64 metrics come back as JSON strings; int() handles both.
+                    "impressions": int(view.get("impressions", 0)),
+                    "clicks": int(view.get("clicks", 0)),
+                }
+            )
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+        logger.info(f"  Fetched {len(all_rows)} rows so far, paginating...")
+
+    logger.info(f"Total rows fetched: {len(all_rows)}")
+    return all_rows
+
+
+# ──────────────────────────────────────────────────────────────────────
+# BigQuery operations — no staging, direct temp table + MERGE
+# ──────────────────────────────────────────────────────────────────────
+TABLE_SCHEMA = [
+    bigquery.SchemaField("date", "DATE"),
+    bigquery.SchemaField("program", "STRING"),
+    bigquery.SchemaField("country_code", "STRING"),
+    bigquery.SchemaField("offer_id", "STRING"),
+    bigquery.SchemaField("impressions", "INTEGER"),
+    bigquery.SchemaField("clicks", "INTEGER"),
+]
+
+
+def ensure_target_table(bq_client):
+    """Create the target table if it doesn't exist."""
+    try:
+        bq_client.get_table(TARGET_TABLE)
+        logger.info(f"Target table exists: {TARGET_TABLE}")
+    except Exception:
+        table_ref = bigquery.Table(TARGET_TABLE, schema=TABLE_SCHEMA)
+        bq_client.create_table(table_ref)
+        logger.info(f"Created target table: {TARGET_TABLE}")
+
+
+def merge_rows(bq_client, rows: list[dict]):
+    """
+    Load rows into a temp table, MERGE into target, then drop temp.
+    No persistent staging table needed.
+    """
+    # Temp name scoped to THIS target table so the parallel Content API
+    # pipeline's temp table (also per-day) can't truncate ours mid-flight.
+    temp_table = f"{BQ_PROJECT}.{BQ_DATASET}._temp_{BQ_TABLE}_{date.today().strftime('%Y%m%d')}"
+
+    # Load to temp
+    logger.info(f"Loading {len(rows)} rows to temp table: {temp_table}")
+    job_config = bigquery.LoadJobConfig(
+        schema=TABLE_SCHEMA,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+    )
+    job = bq_client.load_table_from_json(rows, temp_table, job_config=job_config)
+    job.result()
+    logger.info(f"Temp load complete: {job.output_rows} rows")
+
+    # MERGE
+    merge_sql = f"""
+    MERGE `{TARGET_TABLE}` AS target
+    USING `{temp_table}` AS source
+    ON target.date = source.date
+       AND target.program = source.program
+       AND target.country_code = source.country_code
+       AND target.offer_id = source.offer_id
+    WHEN MATCHED THEN
+        UPDATE SET
+            clicks = source.clicks,
+            impressions = source.impressions
+    WHEN NOT MATCHED THEN
+        INSERT (date, program, country_code, offer_id, clicks, impressions)
+        VALUES (source.date, source.program, source.country_code,
+                source.offer_id, source.clicks, source.impressions)
+    """
+
+    logger.info("Running MERGE...")
+    query_job = bq_client.query(merge_sql)
+    query_job.result()
+    dml = query_job.num_dml_affected_rows
+    logger.info(f"MERGE complete. Rows affected: {dml}")
+
+    # Drop temp
+    bq_client.delete_table(temp_table, not_found_ok=True)
+    logger.info(f"Temp table dropped: {temp_table}")
+
+    return dml
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Pipeline orchestration
+# ──────────────────────────────────────────────────────────────────────
+def date_range_chunks(start_date: str, end_date: str, chunk_days: int):
+    """Yield (chunk_start, chunk_end) date string pairs."""
+    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+    current = start
+    while current <= end:
+        chunk_end = min(current + timedelta(days=chunk_days - 1), end)
+        yield current.isoformat(), chunk_end.isoformat()
+        current = chunk_end + timedelta(days=1)
+
+
+def run_pipeline(start_date: str, end_date: str, chunk_days: int = 0) -> dict:
+    """
+    Execute the full pipeline.
+    If chunk_days > 0, splits the range into chunks to avoid
+    memory/timeout issues on large backfills.
+    """
+    credentials = get_credentials()
+    service = build_reports_service(credentials)
+    bq_client = bigquery.Client(project=BQ_PROJECT, credentials=credentials)
+
+    ensure_target_table(bq_client)
+
+    total_fetched = 0
+    total_merged = 0
+
+    if chunk_days > 0:
+        chunks = list(date_range_chunks(start_date, end_date, chunk_days))
+        logger.info(f"Chunked mode: {len(chunks)} chunks of {chunk_days} days")
+
+        for i, (cs, ce) in enumerate(chunks, 1):
+            logger.info(f"Chunk {i}/{len(chunks)}: {cs} to {ce}")
+            rows = fetch_performance_data(service, cs, ce)
+            if rows:
+                dml = merge_rows(bq_client, rows)
+                total_fetched += len(rows)
+                total_merged += dml
+            else:
+                logger.info(f"  No data for chunk {cs} to {ce}")
+    else:
+        rows = fetch_performance_data(service, start_date, end_date)
+        if rows:
+            total_fetched = len(rows)
+            total_merged = merge_rows(bq_client, rows)
+
+    if total_fetched == 0:
+        logger.warning("No data returned from API.")
+        return {
+            "status": "no_data",
+            "start_date": start_date,
+            "end_date": end_date,
+            "rows_fetched": 0,
+        }
+
+    return {
+        "status": "success",
+        "start_date": start_date,
+        "end_date": end_date,
+        "rows_fetched": total_fetched,
+        "rows_merged": total_merged,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Cloud Function entry point
+# ──────────────────────────────────────────────────────────────────────
+@functions_framework.http
+def main(request: flask.Request) -> flask.Response:
+    """
+    HTTP Cloud Function entry point.
+
+    Default (no body): pulls yesterday's data.
+    With JSON body:
+        {"start_date": "2024-06-01", "end_date": "2026-04-30"}
+        {"start_date": "2024-06-01", "end_date": "2026-04-30", "chunk_days": 30}
+        {"days": 3}
+    """
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+
+    if "days" in body:
+        days = int(body["days"])
+        end_date = yesterday
+        start_date = (date.today() - timedelta(days=days)).isoformat()
+    else:
+        start_date = body.get("start_date", yesterday)
+        end_date = body.get("end_date", yesterday)
+
+    chunk_days = int(body.get("chunk_days", 0))
+
+    logger.info(f"Triggered. Range: {start_date} to {end_date}, chunk_days: {chunk_days}")
+
+    try:
+        result = run_pipeline(start_date, end_date, chunk_days)
+        logger.info(f"Result: {result}")
+        return flask.jsonify(result), 200
+
+    except Exception as e:
+        logger.error(f"Pipeline failed: {str(e)}", exc_info=True)
+        return flask.jsonify({"status": "error", "message": str(e)}), 500
