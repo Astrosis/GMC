@@ -5,6 +5,9 @@ Pulls product_performance_view with offer_id granularity via the new
 Merchant API (Reports sub-API) and MERGEs directly into
 paid-search-fy26.GMC.GMC_report_mapi. No staging table.
 
+curl -X POST "https://merchantapi.googleapis.com/accounts/v1/accounts/<PARENT_ID>/developerRegistration:registerGcp" -H "Authorization: Bearer $(gcloud auth print-access-token --impersonate-service-account=gmc-sync@paid-search-fy26.iam.gserviceaccount.com --scopes=https://www.googleapis.com/auth/content)" -H "x-goog-user-project: paid-search-fy26" -H "Content-Type: application/json" -d '{"developerEmail": "kevin.ngo@abcam.com"}'
+
+
 PARALLEL-RUN NOTE:
     This is a SEPARATE pipeline from the existing Content API function.
     It writes to its own table (GMC_report_mapi) with its own function name
