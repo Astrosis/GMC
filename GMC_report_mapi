@@ -60,6 +60,7 @@ from datetime import date, datetime, timedelta
 import flask
 import functions_framework
 from google.auth import default as get_default_credentials
+from google.auth.transport.requests import AuthorizedSession
 from googleapiclient.discovery import build
 from google.cloud import bigquery
 
@@ -118,6 +119,40 @@ def get_credentials():
 def build_reports_service(credentials):
     # Merchant API Reports sub-API (replaces the Content API "content" service).
     return build(API_SERVICE, API_VERSION, credentials=credentials)
+
+
+def register_gcp(credentials, account_id: str, developer_email: str) -> dict:
+    """
+    One-shot developer registration. Links THIS GCP project to the Merchant
+    Center account, running as the function's own service account (which must
+    have Merchant Center admin). Required once before the Reports API answers.
+
+    Because this runs inside the project AS the service account, there is no
+    impersonation, no serviceAccountTokenCreator, and no blocked user-consent
+    screen — the exact things that make running it from a laptop painful.
+
+    Trigger via:  {"register": true, "account_id": "<PARENT_ADVANCED_ID>"}
+    Use the PARENT advanced account ID; it covers all sub-accounts.
+    """
+    session = AuthorizedSession(credentials)
+    url = (
+        "https://merchantapi.googleapis.com/accounts/v1/"
+        f"accounts/{account_id}/developerRegistration:registerGcp"
+    )
+    logger.info(f"registerGcp: project={BQ_PROJECT} account={account_id}")
+    resp = session.post(
+        url,
+        headers={"x-goog-user-project": BQ_PROJECT},
+        json={"developerEmail": developer_email},
+    )
+    logger.info(f"registerGcp HTTP {resp.status_code}: {resp.text}")
+    return {
+        "action": "register",
+        "project": BQ_PROJECT,
+        "account_id": account_id,
+        "http_status": resp.status_code,
+        "response": resp.text,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -408,6 +443,7 @@ def main(request: flask.Request) -> flask.Response:
         {"days": 3}
         {"days": 3, "location": "GB"}   # restrict to one country
         {"days": 3, "merchant_id": "<jp_subaccount>"}  # pull a sub-account
+        {"register": true, "account_id": "<PARENT_ADVANCED_ID>"}  # one-time setup
     """
     yesterday = (date.today() - timedelta(days=1)).isoformat()
 
@@ -415,6 +451,22 @@ def main(request: flask.Request) -> flask.Response:
         body = request.get_json(silent=True) or {}
     except Exception:
         body = {}
+
+    # One-shot developer registration, run as the function's own SA (which has
+    # Merchant Center admin). Do this ONCE, then remove/ignore the flag.
+    if body.get("register"):
+        account_id = str(body.get("account_id", MERCHANT_ID)).strip()
+        developer_email = str(
+            body.get("developer_email", "kevin.ngo@abcam.com")
+        ).strip()
+        try:
+            credentials = get_credentials()
+            result = register_gcp(credentials, account_id, developer_email)
+            code = 200 if result["http_status"] == 200 else 502
+            return flask.jsonify(result), code
+        except Exception as e:
+            logger.error(f"Registration failed: {str(e)}", exc_info=True)
+            return flask.jsonify({"status": "error", "message": str(e)}), 500
 
     if "days" in body:
         days = int(body["days"])
