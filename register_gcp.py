@@ -54,34 +54,51 @@ DEFAULT_EMAIL = os.environ.get("DEVELOPER_EMAIL", "kevin.ngo@abcam.com")
 # once first:  gcloud auth application-default login --scopes=openid,\
 #   https://www.googleapis.com/auth/content,\
 #   https://www.googleapis.com/auth/cloud-platform
-IMPERSONATE = SERVICE_ACCOUNT.strip().lower() not in ("", "none", "-")
-
 CONTENT_SCOPE = "https://www.googleapis.com/auth/content"
 CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("Usage: py register_gcp.py <PARENT_ACCOUNT_ID> [developer_email]")
-        print("  PARENT_ACCOUNT_ID: your Merchant Center *advanced* account ID")
-        sys.exit(0 if len(sys.argv) > 1 else 1)
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print("Usage: py register_gcp.py <PARENT_ACCOUNT_ID> [developer_email] [flags]")
+        print("  PARENT_ACCOUNT_ID   : your Merchant Center *advanced* account ID")
+        print("  --no-impersonate    : register with your own gcloud login")
+        print("  --sa=<email>        : impersonate this service account instead")
+        sys.exit(0 if args else 1)
 
-    parent_id = sys.argv[1].strip().lstrip("accounts/")  # accept bare ID or path
-    developer_email = sys.argv[2].strip() if len(sys.argv) > 2 else DEFAULT_EMAIL
+    # ── Flags (order-independent; more reliable than env vars on Windows) ──
+    no_impersonate = "--no-impersonate" in args
+    args = [a for a in args if a != "--no-impersonate"]
+
+    service_account = SERVICE_ACCOUNT
+    for a in list(args):
+        if a.startswith("--sa="):
+            service_account = a.split("=", 1)[1]
+            args.remove(a)
+
+    # Impersonate unless disabled by flag, env sentinel, or empty SA.
+    impersonate = (
+        not no_impersonate
+        and service_account.strip().lower() not in ("", "none", "-")
+    )
+
+    parent_id = args[0].strip().lstrip("accounts/")  # accept bare ID or path
+    developer_email = args[1].strip() if len(args) > 1 else DEFAULT_EMAIL
 
     print(f"Registering project '{PROJECT}' with Merchant account {parent_id}")
     print(f"  developer email : {developer_email}")
     print(f"  auth mode       : "
-          f"{'impersonate ' + SERVICE_ACCOUNT if IMPERSONATE else 'your gcloud login (no impersonation)'}\n")
+          f"{'impersonate ' + service_account if impersonate else 'your gcloud login (no impersonation)'}\n")
 
     try:
-        if IMPERSONATE:
+        if impersonate:
             # Base (your user / ADC) creds, then impersonate the SA with the
             # content scope so the registered GCP project is the SA's project.
             source_creds, _ = google.auth.default(scopes=[CLOUD_SCOPE])
             creds = impersonated_credentials.Credentials(
                 source_credentials=source_creds,
-                target_principal=SERVICE_ACCOUNT,
+                target_principal=service_account,
                 target_scopes=[CONTENT_SCOPE],
             )
         else:
@@ -91,18 +108,23 @@ def main():
         session = AuthorizedSession(creds)
     except Exception as e:
         print(f"❌ Auth setup failed: {e}")
-        if "gaia id not found" in str(e).lower():
+        msg = str(e).lower()
+        if "gaia id not found" in msg:
             print(
-                f"   The service account '{SERVICE_ACCOUNT}' does not exist in "
+                f"   The service account '{service_account}' does not exist in "
                 f"project '{PROJECT}'.\n"
-                "   Create it (gcloud iam service-accounts create gmc-sync ...) "
-                "OR skip impersonation by setting GMC_SERVICE_ACCOUNT= (empty)."
+                "   Create it, pass a real one with --sa=<email>, or run with "
+                "--no-impersonate to use your own login."
+            )
+        elif "getaccesstoken" in msg or "permission" in msg:
+            print(
+                f"   You lack roles/iam.serviceAccountTokenCreator on "
+                f"'{service_account}'.\n"
+                "   Fix: grant that role, OR just run with --no-impersonate "
+                "to register with your own login (needs Merchant Center admin)."
             )
         else:
-            print(
-                "   Check: `gcloud auth login` done, and you hold "
-                "roles/iam.serviceAccountTokenCreator on the service account."
-            )
+            print("   Check `gcloud auth login` / `application-default login`.")
         sys.exit(1)
 
     url = (
