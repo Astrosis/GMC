@@ -29,7 +29,7 @@ Deployment (distinct name/table so it runs parallel to the Content API job):
     gcloud functions deploy gmc-product-sync-mapi --project=paid-search-fy26 --runtime python312 --trigger-http --entry-point main --timeout 540 --memory 512MB --region europe-west2 --service-account gmc-sync@paid-search-fy26.iam.gserviceaccount.com --set-env-vars MERCHANT_ID=120543441,BQ_PROJECT=paid-search-fy26,BQ_DATASET=GMC,BQ_TABLE=GMC_report_mapi
 
 Cloud Scheduler (daily at 6am UTC):
-    gcloud scheduler jobs create http gmc-product-mapi-daily --schedule "0 6 * * *" --uri "https://europe-west2-paid-search-fy26.cloudfunctions.net/gmc-product-sync-mapi" --http-method POST --oidc-service-account-email gmc-sync@paid-search-fy26.iam.gserviceaccount.com --time-zone "UTC"
+    gcloud scheduler jobs create http gmc-product-mapi-daily --location=europe-west2 --schedule "0 6 * * *" --uri "https://europe-west2-paid-search-fy26.cloudfunctions.net/gmc-product-sync-mapi" --http-method POST --oidc-service-account-email gmc-sync@paid-search-fy26.iam.gserviceaccount.com --time-zone "UTC"
 
 Backfill (one-time, run locally or via curl):
     curl -X POST https://europe-west2-paid-search-fy26.cloudfunctions.net/gmc-product-sync-mapi -H "Authorization: bearer $(gcloud auth print-identity-token)" -H "Content-Type: application/json" -d '{"start_date": "2024-06-01", "end_date": "2026-04-30"}'
