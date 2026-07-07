@@ -42,6 +42,14 @@ SERVICE_ACCOUNT = os.environ.get(
 )
 DEFAULT_EMAIL = os.environ.get("DEVELOPER_EMAIL", "kevin.ngo@abcam.com")
 
+# Impersonation guarantees the *registered* project is the SA's project. Set
+# GMC_SERVICE_ACCOUNT="" (or "none"/"-") to skip it and register using your own
+# gcloud login instead — handy if the SA doesn't exist yet. In that case run
+# once first:  gcloud auth application-default login --scopes=openid,\
+#   https://www.googleapis.com/auth/content,\
+#   https://www.googleapis.com/auth/cloud-platform
+IMPERSONATE = SERVICE_ACCOUNT.strip().lower() not in ("", "none", "-")
+
 CONTENT_SCOPE = "https://www.googleapis.com/auth/content"
 CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
@@ -57,24 +65,38 @@ def main():
 
     print(f"Registering project '{PROJECT}' with Merchant account {parent_id}")
     print(f"  developer email : {developer_email}")
-    print(f"  impersonating   : {SERVICE_ACCOUNT}\n")
+    print(f"  auth mode       : "
+          f"{'impersonate ' + SERVICE_ACCOUNT if IMPERSONATE else 'your gcloud login (no impersonation)'}\n")
 
-    # Base (your user / ADC) credentials, then impersonate the SA with the
-    # content scope so the *registered* GCP project is the SA's project.
     try:
-        source_creds, _ = google.auth.default(scopes=[CLOUD_SCOPE])
-        target_creds = impersonated_credentials.Credentials(
-            source_credentials=source_creds,
-            target_principal=SERVICE_ACCOUNT,
-            target_scopes=[CONTENT_SCOPE],
-        )
-        session = AuthorizedSession(target_creds)
+        if IMPERSONATE:
+            # Base (your user / ADC) creds, then impersonate the SA with the
+            # content scope so the registered GCP project is the SA's project.
+            source_creds, _ = google.auth.default(scopes=[CLOUD_SCOPE])
+            creds = impersonated_credentials.Credentials(
+                source_credentials=source_creds,
+                target_principal=SERVICE_ACCOUNT,
+                target_scopes=[CONTENT_SCOPE],
+            )
+        else:
+            # Use your own login directly; the x-goog-user-project header below
+            # tells the API which project to register (must be PROJECT).
+            creds, _ = google.auth.default(scopes=[CONTENT_SCOPE, CLOUD_SCOPE])
+        session = AuthorizedSession(creds)
     except Exception as e:
         print(f"❌ Auth setup failed: {e}")
-        print(
-            "   Check: `gcloud auth login` done, and you hold "
-            "roles/iam.serviceAccountTokenCreator on the service account."
-        )
+        if "gaia id not found" in str(e).lower():
+            print(
+                f"   The service account '{SERVICE_ACCOUNT}' does not exist in "
+                f"project '{PROJECT}'.\n"
+                "   Create it (gcloud iam service-accounts create gmc-sync ...) "
+                "OR skip impersonation by setting GMC_SERVICE_ACCOUNT= (empty)."
+            )
+        else:
+            print(
+                "   Check: `gcloud auth login` done, and you hold "
+                "roles/iam.serviceAccountTokenCreator on the service account."
+            )
         sys.exit(1)
 
     url = (
