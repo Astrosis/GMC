@@ -43,10 +43,14 @@ from google.auth.transport.requests import AuthorizedSession
 
 # ── Config (env-overridable, matching the pipeline's deployment) ──────────
 PROJECT = os.environ.get("BQ_PROJECT", "paid-search-fy26")
-SERVICE_ACCOUNT = os.environ.get(
-    "GMC_SERVICE_ACCOUNT", "gmc-sync@paid-search-fy26.iam.gserviceaccount.com"
-)
 DEFAULT_EMAIL = os.environ.get("DEVELOPER_EMAIL", "kevin.ngo@abcam.com")
+
+# NOTE: registerGcp must run as a HUMAN account that holds the Merchant Center
+# ADMIN role — the Merchant API rejects service accounts here ("gcp reg is not
+# allowed for SA, please use a human account"). So the DEFAULT is your own
+# gcloud login. --sa / --key remain only for edge cases / other API calls.
+# Empty default => no impersonation => your human login is used.
+SERVICE_ACCOUNT = os.environ.get("GMC_SERVICE_ACCOUNT", "")
 
 CONTENT_SCOPE = "https://www.googleapis.com/auth/content"
 CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
